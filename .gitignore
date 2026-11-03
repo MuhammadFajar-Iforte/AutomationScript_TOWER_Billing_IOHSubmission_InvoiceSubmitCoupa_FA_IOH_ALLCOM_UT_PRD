@@ -1,0 +1,37 @@
+# Coupa Invoice Automation - Git Ignore
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+.kiro/
+*.swp
+
+# Logs
+logs/
+
+# Screenshots
+screenshots/
+
+# Temporary files
+temp/
+tmp/
+
+# RPA working files
+RPA/
+
+# Excel temp files
+~$*.xlsx
+~$*.xls
+
+# OS files
+.DS_Store
+Thumbs.db

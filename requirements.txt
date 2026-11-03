@@ -1,0 +1,22 @@
+# Coupa Invoice Automation - Python Dependencies
+# Install with: pip install -r requirements.txt
+# Tested on Python 3.13
+
+# Web Automation
+selenium==4.18.1
+webdriver-manager>=4.0.2
+
+# Excel Processing
+openpyxl==3.1.2
+pandas>=2.2.2
+
+# Database
+pyodbc>=5.1.0
+sqlalchemy>=2.0.25
+
+# Microsoft Graph API / OneDrive
+msal>=1.31.1
+requests>=2.32.3
+
+# HTTP Utilities (for WhatsApp notification)
+urllib3>=2.2.0
