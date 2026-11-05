@@ -8,13 +8,16 @@ State: GET_TRANSACTION_DATA
 """
 
 import os
+import time
 import logging
+import urllib.parse
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
 
 import openpyxl
 import pyodbc
 import pandas as pd
+import requests
 
 from framework.models import TransactionItem, BusinessRuleException
 
@@ -115,12 +118,273 @@ def execute(context) -> List[TransactionItem]:
     """
     Execute GET_TRANSACTION_DATA state.
     
-    Loads transaction data from SQL Server, creates input file, and validates.
+    Routes to the appropriate data source based on context.input_source:
+    - "database" (default): Load from SQL Server, create input file, and validate
+    - "onedrive": Download input Excel file from OneDrive and validate
     
     Returns:
         List of TransactionItem to process
     """
+    input_source = (getattr(context, "input_source", "database") or "database").lower()
+    
+    if input_source == "onedrive":
+        return _load_from_onedrive(context)
+    
     return _load_from_database(context)
+
+
+def _resolve_column_candidates(value) -> List[str]:
+    """
+    Pecah value mapping kolom ber-separator ';' menjadi daftar kandidat.
+    
+    Contoh: "ENTITY;NAME" -> ["ENTITY", "NAME"]
+    Robot memakai kandidat pertama yang kolomnya ketemu.
+    """
+    if value is None or pd.isna(value):
+        return []
+    return [part.strip() for part in str(value).split(";") if part.strip()]
+
+
+def _parse_required_flag(value, key_name: str, column: str) -> bool:
+    """Parse nilai kolom Required DB/Excel. Hanya menerima 'yes'/'no' (case-insensitive)."""
+    if value is None or not str(value).strip():
+        raise BusinessRuleException(
+            f"Lengkapi file mapping: kolom '{column}' untuk key '{key_name}' kosong (isi yes/no)",
+            error_code="BRE-MAP-002"
+        )
+    flag = str(value).strip().lower()
+    if flag not in ("yes", "no"):
+        raise BusinessRuleException(
+            f"Lengkapi file mapping: kolom '{column}' untuk key '{key_name}' "
+            f"berisi '{value}' (harus yes/no)",
+            error_code="BRE-MAP-002"
+        )
+    return flag == "yes"
+
+
+def _load_key_field_mapping(master_data_file: str) -> Dict[str, Dict[str, Any]]:
+    """
+    Baca sheet 'Mapping Field' dari Master Data.xlsx.
+    
+    Struktur sheet: baris 1 = header (Key Name, Database, Required DB,
+    Excel One Drive, Required Excel, Description), baris 2 ke bawah = mapping per key.
+    Kolom Database dan Excel One Drive mendukung multi kandidat dipisah ';'.
+    
+    Returns:
+        {key_name: {"database": [kandidat], "excel_one_drive": [kandidat],
+                    "required_db": bool, "required_excel": bool}}
+    
+    Raises:
+        BusinessRuleException: jika file/sheet tidak ada, kosong, atau
+                               kolom required tidak berisi yes/no (tanpa fallback)
+    """
+    if not os.path.exists(master_data_file):
+        raise BusinessRuleException(
+            f"Lengkapi file mapping: master data file tidak ditemukan: {master_data_file}",
+            error_code="BRE-MAP-001"
+        )
+    
+    wb = openpyxl.load_workbook(master_data_file, data_only=True)
+    
+    if "Mapping Field" not in wb.sheetnames:
+        wb.close()
+        raise BusinessRuleException(
+            f"Lengkapi file mapping: sheet 'Mapping Field' tidak ditemukan di {master_data_file}",
+            error_code="BRE-MAP-001"
+        )
+    
+    ws = wb["Mapping Field"]
+    mapping = {}
+    
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        key_name = row[0] if len(row) > 0 else None
+        if key_name is None or not str(key_name).strip():
+            continue
+        key_name = str(key_name).strip()
+        mapping[key_name] = {
+            "database": _resolve_column_candidates(row[1] if len(row) > 1 else None),
+            "excel_one_drive": _resolve_column_candidates(row[3] if len(row) > 3 else None),
+            "required_db": _parse_required_flag(
+                row[2] if len(row) > 2 else None, key_name, "Required DB"),
+            "required_excel": _parse_required_flag(
+                row[4] if len(row) > 4 else None, key_name, "Required Excel")
+        }
+    
+    wb.close()
+    
+    if not mapping:
+        raise BusinessRuleException(
+            f"Lengkapi file mapping: sheet 'Mapping Field' di {master_data_file} kosong",
+            error_code="BRE-MAP-001"
+        )
+    
+    logger.info(f"Mapping Field loaded: {len(mapping)} keys")
+    return mapping
+
+
+def _download_onedrive_input_file(client, upn: str, onedrive_path: str, local_path: str) -> str:
+    """
+    Download file input dari drive OneDrive user tertentu (app-level auth).
+    
+    Retry 3x dengan interval 5 detik, konsisten dengan perilaku library.
+    
+    Returns:
+        Path lokal file yang tersimpan
+    """
+    encoded = urllib.parse.quote(onedrive_path.strip("/"))
+    url = f"{client.GRAPH_API_BASE}/users/{upn}/drive/root:/{encoded}:/content"
+    headers = client._get_headers()
+    
+    last_error = None
+    for attempt in range(1, 4):
+        try:
+            response = requests.get(url, headers=headers, timeout=120, stream=True)
+            if response.status_code == 200:
+                os.makedirs(os.path.dirname(local_path), exist_ok=True)
+                with open(local_path, "wb") as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        f.write(chunk)
+                return local_path
+            last_error = f"HTTP {response.status_code}: {response.text[:200]}"
+            logger.warning(f"Download attempt {attempt}/3 gagal: {last_error}")
+        except requests.exceptions.RequestException as e:
+            last_error = str(e)
+            logger.warning(f"Download attempt {attempt}/3 error: {e}")
+        
+        if attempt < 3:
+            time.sleep(5)
+    
+    raise BusinessRuleException(
+        f"Download file input dari OneDrive gagal ({upn} -> {onedrive_path}): {last_error}",
+        error_code="BRE-OD-007"
+    )
+
+
+def _extract_dataframe_from_onedrive_file(local_path: str) -> pd.DataFrame:
+    """
+    Baca file input hasil download OneDrive menjadi DataFrame dengan header
+    dinormalisasi ke Key Name (per sheet 'Key Field').
+    
+    Header di baris 5, data mulai baris 6. Header yang cocok dengan salah satu
+    kandidat 'Excel One Drive' di-rename ke Key Name; header lain dibiarkan.
+    """
+    key_field_mapping = _load_key_field_mapping(_current_master_data_file)
+    
+    candidate_to_key = {}
+    for key_name, cols in key_field_mapping.items():
+        for candidate in cols["excel_one_drive"]:
+            candidate_to_key[candidate.lower()] = key_name
+    
+    wb = openpyxl.load_workbook(local_path, data_only=True, read_only=True)
+    ws = wb.active
+    
+    headers = []
+    for col in range(1, ws.max_column + 1):
+        header_value = ws.cell(row=5, column=col).value
+        if header_value is None:
+            headers.append(None)
+            continue
+        header_str = str(header_value).strip()
+        headers.append(candidate_to_key.get(header_str.lower(), header_str))
+    
+    rows = []
+    for row in ws.iter_rows(min_row=6, values_only=True):
+        if any(cell is not None for cell in row):
+            rows.append(row)
+    
+    wb.close()
+    
+    df = pd.DataFrame(rows, columns=headers)
+    logger.info(f"File OneDrive dibaca: {len(df)} baris, kolom ternormalisasi: "
+                f"{[h for h in headers if h]}")
+    return df
+
+
+def _load_from_onedrive(context) -> List[TransactionItem]:
+    """
+    Load transaction data dari file input Excel di OneDrive.
+    
+    Flow:
+    1. Ambil template path dari config ONEDRIVE_FILE_INPUT
+       (format: <pemilik-drive>/<folder>/.../{filename}), {filename} dari --filename
+    2. Download file ke folder PATH_DOWNLOAD_FILE_INPUT
+    3. Baca file jadi DataFrame dengan header dinormalisasi ke Key Name
+    4. Ikuti pipeline yang sama dengan mode database
+       (template input, site-qty mapping, validasi)
+    """
+    filename = getattr(context, "onedrive_input_file", None)
+    if not filename:
+        raise BusinessRuleException(
+            "Filename tidak dispesifikkan. Gunakan --filename saat --source onedrive",
+            error_code="BRE-OD-001"
+        )
+    
+    if not context.onedrive_client:
+        raise BusinessRuleException(
+            "OneDrive client tidak terinisialisasi. Cek kredensial OneDrive di Config.xlsx "
+            "(OneDrive_Client_ID, OneDrive_Client_Secret, OneDrive_Tenant_ID, User_Principal_Name)",
+            error_code="BRE-OD-002"
+        )
+    
+    template = str(context.config.get("ONEDRIVE_FILE_INPUT", "")).strip().strip("/")
+    if not template or "{filename}" not in template:
+        raise BusinessRuleException(
+            "Config key 'ONEDRIVE_FILE_INPUT' tidak ada/kosong/tanpa placeholder {filename}",
+            error_code="BRE-OD-005"
+        )
+    
+    onedrive_path = template.replace("{filename}", str(filename).strip())
+    parts = [p.strip() for p in onedrive_path.split("/") if p.strip()]
+    if len(parts) < 2:
+        raise BusinessRuleException(
+            "ONEDRIVE_FILE_INPUT minimal 2 segmen: <pemilik-drive>/<folder>/.../{filename}",
+            error_code="BRE-OD-006"
+        )
+    
+    owner = parts[0]
+    upn = owner if "@" in owner else f"{owner}@protelindo.net"
+    path_in_drive = "/".join(parts[1:])
+    
+    logger.info(f"Downloading input file dari OneDrive: {upn} -> {path_in_drive}")
+    
+    local_folder = context.config.get("PATH_DOWNLOAD_FILE_INPUT", "RPA/File Input")
+    os.makedirs(local_folder, exist_ok=True)
+    base, ext = os.path.splitext(str(filename))
+    local_path = os.path.abspath(os.path.join(local_folder, f"{base}_{context.run_timestamp}{ext or '.xlsx'}"))
+    
+    _download_onedrive_input_file(context.onedrive_client, upn, path_in_drive, local_path)
+    logger.info(f"Input file tersimpan lokal: {local_path}")
+    
+    global _current_master_data_file
+    _current_master_data_file = context.config.get("Mapping Process", "Data/Master Data.xlsx")
+    df = _extract_dataframe_from_onedrive_file(local_path)
+    
+    if df.empty:
+        logger.warning("File OneDrive tidak berisi data transaksi")
+        return []
+    
+    df_columns_lower = {col.lower(): col for col in df.columns}
+    po_col = df_columns_lower.get("po number")
+    context.total_po_from_db = df[po_col].nunique() if po_col else 0
+    
+    master_data_file = _current_master_data_file
+    wht_mapping = _load_wht_mapping(master_data_file)
+    default_vat = context.config.get("Default_VAT", "ID:M1")
+    
+    # WHT di file OneDrive sudah berupa kode final - tanpa konversi rate
+    input_file_path = _create_input_file_from_template(
+        context, df, wht_mapping, default_vat, convert_wht=False)
+    if not input_file_path:
+        raise BusinessRuleException(
+            "Gagal membuat input file dari hasil download OneDrive",
+            error_code="BRE-OD-008"
+        )
+    
+    context.config["Local_Input_File"] = input_file_path
+    context.onedrive_input_source_path = path_in_drive
+    context.site_qty_mapping = _build_site_qty_mapping(df)
+    
+    return _load_from_excel(context)
 
 
 def _load_from_database(context) -> List[TransactionItem]:
@@ -145,7 +409,7 @@ def _load_from_database(context) -> List[TransactionItem]:
         )
     
     # Load WHT mapping from master data
-    master_data_file = context.config.get("Master_Data_Header_File", "Data/Master Data.xlsx")
+    master_data_file = context.config.get("Mapping Process", "Data/Master Data.xlsx")
     wht_mapping = _load_wht_mapping(master_data_file)
     
     # Get default VAT from config
@@ -215,7 +479,8 @@ def _load_from_database(context) -> List[TransactionItem]:
         )
 
 
-def _create_input_file_from_template(context, df: pd.DataFrame, wht_mapping: Dict[float, str], default_vat: str) -> Optional[str]:
+def _create_input_file_from_template(context, df: pd.DataFrame, wht_mapping: Dict[float, str],
+                                     default_vat: str, convert_wht: bool = True) -> Optional[str]:
     """
     Create input file from template Excel by inserting DataFrame data.
     
@@ -295,14 +560,14 @@ def _create_input_file_from_template(context, df: pd.DataFrame, wht_mapping: Dic
                     if pd.isna(value):
                         value = None
                     
-                    # Special handling for WHT Code - convert rate to code
-                    if col_name == 'WHT Code' and value is not None:
+                    # Special handling for WHT Code - convert rate to code.
+                    # convert_wht=False (mode OneDrive): nilai sudah kode final, tulis apa adanya.
+                    if col_name == 'WHT Code' and value is not None and convert_wht:
                         wht_code = _get_wht_code(value, wht_mapping)
                         if wht_code:
                             value = wht_code
                         else:
-                            logger.warning(f"Row {excel_row}: WHT rate '{value}' not found in mapping")
-                            value = None
+                            logger.warning(f"Row {excel_row}: WHT rate '{value}' not found in mapping, keeping original value")
                     
                     ws.cell(row=excel_row, column=col_idx).value = value
                 
@@ -429,11 +694,23 @@ def _load_from_excel(context) -> List[TransactionItem]:
             if header_value:
                 header_mapping[str(header_value).strip().lower()] = col
         
-        logger.debug(f"Header mapping from file: {header_mapping}")
+        # Load mapping + required fields per sumber (Mapping Field sheet, tanpa fallback)
+        master_data_file = context.config.get("Mapping Process", "Data/Master Data.xlsx")
+        global _current_master_data_file
+        _current_master_data_file = master_data_file
+        key_field_mapping = _load_key_field_mapping(master_data_file)
+        
+        is_onedrive = (getattr(context, "input_source", "database") or "database").lower() == "onedrive"
+        required_flag = "required_excel" if is_onedrive else "required_db"
+        required_attrs = {}
+        for key_name, cols in key_field_mapping.items():
+            if cols[required_flag]:
+                required_attrs[_key_to_attr(key_name)] = key_name
         
         # Read all transactions
         transactions = []
         seen_invoices = {}
+        skipped_rows = []
         
         for row_num in range(6, ws.max_row + 1):
             # Check if row has data
@@ -480,13 +757,13 @@ def _load_from_excel(context) -> List[TransactionItem]:
             )
             
             # Validate required fields - SKIP row if invalid
-            missing_fields = _validate_transaction(transaction)
+            missing_fields = _validate_transaction(transaction, required_attrs)
             if missing_fields:
                 skip_reason = f"Skipped - Missing: {', '.join(missing_fields)}"
                 logger.warning(f"Row {row_num}: {skip_reason}")
                 
-                # Update Excel status for skipped row
-                _update_skipped_row_status(input_file, row_num, skip_reason, context.run_timestamp)
+                # Collect skipped row - status akan ditulis batch di akhir
+                skipped_rows.append((row_num, skip_reason))
                 
                 # Store skipped transaction info for later DB update
                 context.skipped_transactions.append({
@@ -506,6 +783,23 @@ def _load_from_excel(context) -> List[TransactionItem]:
             seen_invoices[unique_key] = transaction
         
         wb.close()
+        
+        # Tulis status semua baris skip dalam satu operasi buka-save
+        if skipped_rows:
+            _update_skipped_rows_status_batch(input_file, skipped_rows, context.run_timestamp)
+        
+        # Grouping by entity (kode kanonik, resolve alias) sebelum masuk Process:
+        # selesaikan semua transaksi satu entity dulu, dalam entity urut per PO+Invoice.
+        # Dengan begitu login/logout minimal 1x per perusahaan.
+        def _entity_sort_key(t: TransactionItem):
+            raw = str(t.tower_provider_name or "").strip().upper()
+            entity = context.company_aliases.get(raw, raw)
+            return (entity, str(t.po_number or ""), str(t.invoice_number or ""))
+        
+        transactions.sort(key=_entity_sort_key)
+        distinct_entities = {(_entity_sort_key(t)[0]) for t in transactions}
+        logger.info(f"Transaction order: {len(distinct_entities)} entity -> "
+                    f"{', '.join(sorted(distinct_entities))}")
         
         if not transactions:
             logger.warning("No valid transactions to process")
@@ -537,28 +831,31 @@ def _get_cell_value(ws, row: int, header_mapping: dict, field_name: str):
     return None
 
 
-def _validate_transaction(transaction: TransactionItem) -> List[str]:
+_ATTR_OVERRIDES = {
+    "IOH Site ID Active": "site_name_ioh"
+}
+
+
+def _key_to_attr(key_name: str) -> str:
+    """Konversi Key Name ke nama atribut TransactionItem (snake_case)."""
+    if key_name in _ATTR_OVERRIDES:
+        return _ATTR_OVERRIDES[key_name]
+    return key_name.lower().replace(" ", "_")
+
+
+def _validate_transaction(transaction: TransactionItem, required_attrs: Dict[str, str]) -> List[str]:
     """
-    Validate required fields in transaction.
+    Validasi field required sesuai sheet Mapping Field (data-driven per sumber).
+    
+    Args:
+        transaction: TransactionItem yang divalidasi
+        required_attrs: {atribut TransactionItem: display name key} yang required
     
     Returns:
         List of missing field names
     """
-    required_fields = {
-        "tower_provider_name": "Tower Provider Name",
-        "po_number": "PO Number",
-        "invoice_number": "Invoice Number",
-        "invoice_line_number": "Invoice Line Number",
-        "invoice_description": "Invoice Description",
-        "payment_period_start": "Payment Period Start",
-        "ba_number": "BA Number",
-        "tax_invoice_number": "Tax Invoice Number",
-        "tax_invoice_date": "Tax Invoice Date",
-        "invoice_amount": "Invoice Amount"
-    }
-    
     missing = []
-    for attr, display_name in required_fields.items():
+    for attr, display_name in required_attrs.items():
         value = getattr(transaction, attr, None)
         if value is None or (isinstance(value, str) and not value.strip()):
             missing.append(display_name)
@@ -566,17 +863,24 @@ def _validate_transaction(transaction: TransactionItem) -> List[str]:
     return missing
 
 
-def _update_skipped_row_status(file_path: str, row_index: int, status: str, run_timestamp: str):
+def _update_skipped_rows_status_batch(file_path: str, skipped_rows: List[tuple], run_timestamp: str):
     """
-    Update Status RPA and Modified Date for skipped rows.
+    Update Status RPA and Modified Date untuk semua baris skip dalam satu operasi.
     
-    Called when a row fails validation and is skipped.
-    Updates columns:
+    Called after validation loop finishes. Updates columns:
     - Col 18 = Status RPA
     - Col 19 = Modified Date
     
     Note: Invoice Date (Col 17) is NOT updated for skipped rows since no invoice was processed.
+    
+    Args:
+        file_path: Path file input Excel
+        skipped_rows: List of (row_index, status) tuples
+        run_timestamp: Run timestamp untuk Modified Date
     """
+    if not skipped_rows:
+        return
+    
     if not file_path or not os.path.exists(file_path):
         logger.warning(f"Cannot update skipped row status - file not found: {file_path}")
         return
@@ -589,14 +893,14 @@ def _update_skipped_row_status(file_path: str, row_index: int, status: str, run_
         wb = openpyxl.load_workbook(file_path)
         ws = wb.active
         
-        # Update status columns
-        ws.cell(row=row_index, column=col_status_rpa).value = status
-        ws.cell(row=row_index, column=col_modified_date).value = run_timestamp
+        for row_index, status in skipped_rows:
+            ws.cell(row=row_index, column=col_status_rpa).value = status
+            ws.cell(row=row_index, column=col_modified_date).value = run_timestamp
         
         wb.save(file_path)
         wb.close()
         
-        logger.info(f"Excel updated (skipped): row {row_index}")
+        logger.info(f"Excel updated (skipped): {len(skipped_rows)} rows")
         
     except Exception as e:
         logger.error(f"Failed to update skipped row status: {e}")

@@ -51,22 +51,17 @@ def load_config_only(context):
         context.is_config_loaded = True
     
     # --------------------------------------
-    # 2. LOAD MASTER DATA HEADERS
-    # --------------------------------------
-    _load_master_data_headers(context)
-    
-    # --------------------------------------
-    # 3. LOAD COMPANY CREDENTIALS
+    # 2. LOAD COMPANY CREDENTIALS
     # --------------------------------------
     _load_company_credentials(context)
     
     # --------------------------------------
-    # 4. INITIALIZE ONEDRIVE (if configured)
+    # 3. INITIALIZE ONEDRIVE (if configured)
     # --------------------------------------
     _init_onedrive(context)
     
     # --------------------------------------
-    # 5. INITIALIZE WHATSAPP NOTIFIER (if configured)
+    # 4. INITIALIZE WHATSAPP NOTIFIER (if configured)
     # --------------------------------------
     _init_whatsapp(context)
 
@@ -109,7 +104,7 @@ def _load_configuration(context):
         "local_input_file": "Local_Input_File",
         "local_attachment_path": "Local_Attachment_Path",
         "output_folder": "Output_Folder",
-        "master_data_header_file": "Master_Data_Header_File",
+        "mapping process": "Mapping Process",
         "master_data_file": "Master_Data_File",
         "email_enabled": "Email_Enabled",
         "email_sender": "Email_Sender",
@@ -173,52 +168,6 @@ def _load_configuration(context):
     logger.info(f"Input: SQL Server ({context.config.get('DB_Server')}/{context.config.get('DB_Database')})")
 
 
-def _load_master_data_headers(context):
-    """Load header names from master data file."""
-    header_file = context.config.get("Master_Data_Header_File", "Data/Master Data.xlsx")
-    
-    if not os.path.exists(header_file):
-        raise BusinessRuleException(
-            f"Master data header file not found: {header_file}",
-            error_code="BRE-001"
-        )
-    
-    try:
-        wb = openpyxl.load_workbook(header_file, data_only=True)
-        
-        # Read from 'List Header' sheet
-        if "List Header" in wb.sheetnames:
-            ws = wb["List Header"]
-        else:
-            ws = wb.active
-        
-        headers = []
-        for row_num in range(6, ws.max_row + 1):
-            header_value = ws.cell(row=row_num, column=1).value
-            if header_value:
-                headers.append(str(header_value).strip())
-            else:
-                break
-        
-        wb.close()
-        
-        if not headers:
-            raise BusinessRuleException(
-                "No headers found in master data header file",
-                error_code="BRE-002"
-            )
-        
-        context.header_mapping = {h.lower(): idx + 1 for idx, h in enumerate(headers)}
-        
-    except BusinessRuleException:
-        raise
-    except Exception as e:
-        raise BusinessRuleException(
-            f"Error loading master data headers: {e}",
-            error_code="BRE-003"
-        )
-
-
 def _load_company_credentials(context):
     """Load company credentials from master data Excel file."""
     master_data_file = context.config.get("Master_Data_File", "Data/Account Coupa IOH.xlsx")
@@ -236,15 +185,25 @@ def _load_company_credentials(context):
         for row_num in range(2, ws.max_row + 1):
             company = ws.cell(row=row_num, column=1).value
             if company:
-                company_code = str(company).strip().upper()
+                # Multi alias dengan separator ';' — alias pertama = kode kanonik
+                aliases = [a.strip().upper() for a in str(company).split(";") if a.strip()]
+                if not aliases:
+                    continue
+                
+                canonical_code = aliases[0]
                 username = ws.cell(row=row_num, column=2).value
                 password = ws.cell(row=row_num, column=3).value
                 
-                context.all_credentials[company_code] = CompanyCredentials(
-                    company_code=company_code,
+                credentials = CompanyCredentials(
+                    company_code=canonical_code,
                     username=str(username).strip() if username else None,
                     password=str(password).strip() if password else None
                 )
+                
+                # Semua alias menunjuk objek kredensial yang sama
+                for alias in aliases:
+                    context.all_credentials[alias] = credentials
+                    context.company_aliases[alias] = canonical_code
         
         wb.close()
         
@@ -254,7 +213,8 @@ def _load_company_credentials(context):
                 error_code="BRE-005"
             )
         
-        logger.info(f"Companies: {', '.join(context.all_credentials.keys())}")
+        canonical_companies = sorted(set(context.company_aliases.values()))
+        logger.info(f"Companies: {', '.join(canonical_companies)}")
         
     except BusinessRuleException:
         raise

@@ -24,6 +24,7 @@ screenshots/
 # Temporary files
 temp/
 tmp/
+Data/_tmp*
 
 # RPA working files
 RPA/
@@ -31,6 +32,10 @@ RPA/
 # Excel temp files
 ~$*.xlsx
 ~$*.xls
+
+# Agent skills & project instructions (tidak dipush)
+.agents/
+AGENTS.md
 
 # OS files
 .DS_Store

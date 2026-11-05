@@ -56,9 +56,10 @@ def execute(context):
     remark = ""
     
     try:
-        # Step 0: Login if company changed
-        if transaction.tower_provider_name != context.current_logged_in_company:
-            _login_for_company(context, transaction.tower_provider_name)
+        # Step 0: Login if company changed (bandingkan kode kanonik, bukan alias mentah)
+        company_code = _resolve_company_code(context, transaction.tower_provider_name)
+        if company_code != context.current_logged_in_company:
+            _login_for_company(context, company_code)
         else:
             logger.info(f"Reusing session for {transaction.tower_provider_name}")
         
@@ -69,7 +70,7 @@ def execute(context):
             pass
         
         # For PTI only: select customer every loop (customer resets per navigation)
-        if transaction.tower_provider_name.upper() == "PTI":
+        if company_code == "PTI":
             logger.info("Selecting customer for PTI...")
             engine.select_customer("PT Indosat Tbk - PROFESIONAL TELEKOMUNIKASI")
         
@@ -205,11 +206,17 @@ def execute(context):
         raise SystemException(f"Unexpected error: {str(e)}", error_code="SYS-099")
 
 
+def _resolve_company_code(context, tower_provider_name: str) -> str:
+    """Resolve nama/alias company ke kode kanonik (per Mapping alias di Account Coupa IOH)."""
+    normalized = str(tower_provider_name or "").strip().upper()
+    return context.company_aliases.get(normalized, normalized)
+
+
 def _login_for_company(context, company_code: str):
     """Login for a specific company."""
     logger.info(f"Logging in for company: {company_code}")
     
-    creds = context.all_credentials.get(company_code)
+    creds = context.all_credentials.get(company_code.strip().upper())
     if not creds or not creds.username:
         raise BusinessRuleException(f"No credentials for company: {company_code}", error_code="BRE-030")
     
@@ -227,19 +234,54 @@ def _login_for_company(context, company_code: str):
 def _validate_attachments(context, transaction, line_count: int) -> tuple:
     """Validate and download attachments from OneDrive."""
     if context.onedrive_client:
-        attachment_base_path = context.config.get("OneDrive_Attachment_Path", "")
+        # Path attachment per sumber data: OneDrive pakai folder dari user
+        is_onedrive = (getattr(context, "input_source", "database") or "database").lower() == "onedrive"
+        original_upn = None
+        
+        if is_onedrive:
+            # Format sama dengan ONEDRIVE_FILE_INPUT:
+            #   <pemilik-drive>/<folder>/...   (alias pertama sebelum '/' = UPN prefix)
+            raw_path = str(context.config.get("ONEDRIVE_ATTACHMENT_FROM_USER", "")).strip().strip("/")
+            parts = [p.strip() for p in raw_path.split("/") if p.strip()]
+            if len(parts) < 2:
+                raise BusinessRuleException(
+                    "ONEDRIVE_ATTACHMENT_FROM_USER minimal 2 segmen: "
+                    "<pemilik-drive>/<folder>/...",
+                    error_code="BRE-040"
+                )
+            
+            owner = parts[0]
+            target_upn = owner if "@" in owner else f"{owner}@protelindo.net"
+            attachment_base_path = "/".join(parts[1:])
+            
+            # Switch drive sementara ke pemilik file, restore setelah selesai
+            # supaya operasi OneDrive lain (upload output) tetap pakai drive default
+            original_upn = context.onedrive_client._user_principal_name
+            context.onedrive_client._user_principal_name = target_upn
+        else:
+            attachment_base_path = context.config.get("OneDrive_Attachment_Path", "")
+        
         local_attachment_path = context.config.get("Local_Attachment_Path", "")
         
         if not attachment_base_path:
+            if is_onedrive:
+                raise BusinessRuleException(
+                    "ONEDRIVE_ATTACHMENT_FROM_USER not configured in Config.xlsx",
+                    error_code="BRE-040"
+                )
             raise BusinessRuleException("OneDrive_Attachment_Path not configured in Config.xlsx", error_code="BRE-040")
         
-        attachment_result = context.onedrive_client.validate_and_download_attachments(
-            invoice_number=transaction.invoice_number,
-            status_site=transaction.status_site,
-            onedrive_base_path=attachment_base_path,
-            local_base_path=local_attachment_path,
-            total_invoice_lines=line_count
-        )
+        try:
+            attachment_result = context.onedrive_client.validate_and_download_attachments(
+                invoice_number=transaction.invoice_number,
+                status_site=transaction.status_site,
+                onedrive_base_path=attachment_base_path,
+                local_base_path=local_attachment_path,
+                total_invoice_lines=line_count
+            )
+        finally:
+            if original_upn is not None:
+                context.onedrive_client._user_principal_name = original_upn
         
         if not attachment_result['success']:
             raise BusinessRuleException(
@@ -429,11 +471,16 @@ def _update_database_status(context, transaction, status: str):
     """
     Update RPA_COUPA_STATUS and RPA_COUPA_DATE in database for all site IDs.
     
+    Hanya aktif di mode database — mode onedrive tanpa DB sama sekali.
+    
     Args:
         context: Bot context
         transaction: TransactionItem being processed
         status: Status message (Success, Business Exception, etc.)
     """
+    if (getattr(context, "input_source", "database") or "database").lower() != "database":
+        return
+    
     from framework.GetTransactionData import update_database_status_bulk
     
     # Get site IDs from site_qty_mapping in context

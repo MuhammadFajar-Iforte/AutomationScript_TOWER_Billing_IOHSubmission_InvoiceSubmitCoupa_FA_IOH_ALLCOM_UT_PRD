@@ -99,6 +99,14 @@ class BotContext:
         self.config: Dict[str, Any] = {}
         self.is_config_loaded = False
         
+        # Input source configuration
+        # "database" (default) or "onedrive"
+        self.input_source: str = "database"
+        # Path to input file in OneDrive (for input_source = "onedrive")
+        self.onedrive_input_file: Optional[str] = None
+        # Actual OneDrive path the input file was downloaded from
+        self.onedrive_input_source_path: Optional[str] = None
+        
         # Transaction management
         self.transaction_number = 1
         self.transaction_item: Optional[TransactionItem] = None
@@ -110,7 +118,8 @@ class BotContext:
         
         # Master data
         self.all_credentials: Dict[str, CompanyCredentials] = {}
-        self.header_mapping: Dict[str, int] = {}
+        # Map alias company (uppercase) -> kode kanonik; alias pertama di file = kanonik
+        self.company_aliases: Dict[str, str] = {}
         
         # Site-Qty mapping for SQL Server mode
         # Key: "po_number_invoice_number", Value: List[{"site_id": str, "qty": int}]

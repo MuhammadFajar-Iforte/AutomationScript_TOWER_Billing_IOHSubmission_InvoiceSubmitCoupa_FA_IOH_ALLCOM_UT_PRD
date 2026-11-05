@@ -6,10 +6,15 @@ This automation processes invoices in Coupa Portal:
 2. Get transaction data from Excel or SQL Server
 3. Process each transaction (login, search PO, create invoice, etc.)
 4. Generate report and send email
+
+Usage:
+    python main.py                              # Data source: SQL Server (default)
+    python main.py --source onedrive --filename "Sample CR 29102026.xlsx"
 """
 
 import os
 import sys
+import argparse
 import logging
 from datetime import datetime
 
@@ -48,6 +53,9 @@ def setup_logging():
 
 def _update_db_status_system_exception(context, transaction, error_message: str):
     """Update database status for system exception (after all retries exhausted)."""
+    if (getattr(context, "input_source", "database") or "database").lower() != "database":
+        return
+    
     try:
         # Get site IDs from site_qty_mapping
         site_qty_key = f"{transaction.po_number}_{transaction.invoice_number}"
@@ -75,8 +83,34 @@ def _update_db_status_system_exception(context, transaction, error_message: str)
         logging.getLogger(__name__).warning(f"Failed to update DB status for system exception: {e}")
 
 
+def parse_arguments():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Coupa Invoice Automation",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    parser.add_argument(
+        "--source",
+        choices=["database", "onedrive"],
+        default="database",
+        help="Transaction data source: 'database' (SQL Server) or 'onedrive' (Excel file in OneDrive)"
+    )
+    parser.add_argument(
+        "--filename",
+        dest="filename",
+        default=None,
+        help=(
+            "Nama file input di OneDrive (wajib saat --source onedrive). "
+            "Diisi ke placeholder {filename} pada config ONEDRIVE_FILE_INPUT"
+        )
+    )
+    return parser.parse_args()
+
+
 def main():
     """Main execution function."""
+    args = parse_arguments()
+    
     log_file = setup_logging()
     logger = logging.getLogger(__name__)
     
@@ -87,9 +121,16 @@ def main():
     logger.info("=" * 60)
     logger.info(f"Start Time: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info(f"Log File: {log_file}")
+    logger.info(f"Input Source: {args.source}")
+    if args.filename:
+        logger.info(f"OneDrive Input File: {args.filename}")
     logger.info("")
     
     context = BotContext()
+    
+    # Apply input source configuration from CLI arguments
+    context.input_source = args.source
+    context.onedrive_input_file = args.filename
     
     try:
         # STEP 1: Load configuration (without opening browser)
@@ -104,10 +145,11 @@ def main():
         context.report.total_transactions = len(context.transaction_data)
         
         # Initialize database connection for status updates (SQL Server mode only)
-        GetTransactionData.init_database_connection(context)
-        
-        # Update skipped transactions to database (after connection is ready)
-        GetTransactionData.update_skipped_transactions_to_db(context)
+        if context.input_source == "database":
+            GetTransactionData.init_database_connection(context)
+            
+            # Update skipped transactions to database (after connection is ready)
+            GetTransactionData.update_skipped_transactions_to_db(context)
         
         if not context.transaction_data:
             logger.warning("No valid transactions to process - ending")
